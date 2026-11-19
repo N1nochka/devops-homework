@@ -12,8 +12,16 @@ log()   { echo "[INFO]  $*"; }
 error() { echo "[ERROR] $*" >&2; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Якщо запущено від root (наприклад, у контейнері) — sudo не потрібен
+# Якщо запущено від root — sudo не потрібен
 if [ "${EUID:-$(id -u)}" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+
+# Реальний користувач і його домашня тека (важливо при запуску через sudo)
+REAL_USER="$(id -un)"
+REAL_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
 
 # ─── Перевірка ОС ────────────────────────────────────────────
 check_os() {
@@ -86,7 +94,6 @@ install_docker_compose() {
 PYTHON_CMD=""
 
 install_python() {
-    # 1. Перевіряємо системний python3
     if command_exists python3; then
         local ver major minor
         ver=$(python3 --version 2>&1 | awk '{print $2}')
@@ -99,12 +106,11 @@ install_python() {
         fi
     fi
 
-    # 2. Пробуємо встановити зі стандартних репозиторіїв
     update_apt
     local v pkg
     for v in 3.9 3.10 3.11 3.12; do
         pkg="python${v}"
-        if apt-cache show "$pkg" >/dev/null 2>&1; then
+        if apt-cache show "$pkg" 2>/dev/null | grep -q "^Package:"; then
             log "Встановлення $pkg зі стандартних репозиторіїв..."
             if $SUDO apt-get install -y "$pkg" "${pkg}-venv" 2>/dev/null \
                || $SUDO apt-get install -y "$pkg"; then
@@ -117,7 +123,12 @@ install_python() {
         fi
     done
 
-    # 3. Fallback: PPA deadsnakes (лише для Ubuntu, бо PPA — це Ubuntu-специфіка)
+    if [ "${ID:-}" != "ubuntu" ]; then
+        error "Не вдалося знайти Python 3.9+ у репозиторіях Debian (${ID:-unknown})."
+        error "Встановіть Python 3.9+ вручну і повторіть запуск."
+        exit 1
+    fi
+
     log "Стандартні репозиторії не містять Python 3.9+. Використовуємо PPA deadsnakes..."
     if ! command_exists add-apt-repository; then
         $SUDO apt-get install -y software-properties-common
@@ -129,14 +140,13 @@ install_python() {
     log "Python 3.9 встановлено: $($PYTHON_CMD --version)"
 }
 
-# ─── Django (через venv — обхід externally-managed-environment) ──
-DJANGO_VENV="$HOME/.devops-venv"
+# ─── Django (через venv) ─────────────────────────────────────
+DJANGO_VENV="$REAL_HOME/.devops-venv"
 DJANGO_PYTHON=""
 
 ensure_venv_package() {
-    # Для створення venv на Debian/Ubuntu потрібен пакет <python>-venv
     local py_base
-    py_base="$(basename "$PYTHON_CMD")"   # python3 або python3.9
+    py_base="$(basename "$PYTHON_CMD")"
     $SUDO apt-get install -y "${py_base}-venv" 2>/dev/null \
         || $SUDO apt-get install -y python3-venv 2>/dev/null \
         || true
@@ -148,14 +158,12 @@ install_django() {
         exit 1
     fi
 
-    # 1. Django вже є у системному Python? Не дублюємо.
     if "$PYTHON_CMD" -m django --version >/dev/null 2>&1; then
         log "Django вже встановлено (системний Python): $("$PYTHON_CMD" -m django --version)"
         DJANGO_PYTHON="$PYTHON_CMD"
         return 0
     fi
 
-    # 2. Django вже є у нашому venv? Не дублюємо.
     if [ -x "$DJANGO_VENV/bin/python" ] \
        && "$DJANGO_VENV/bin/python" -m django --version >/dev/null 2>&1; then
         log "Django вже встановлено у venv: $("$DJANGO_VENV/bin/python" -m django --version)"
@@ -163,7 +171,6 @@ install_django() {
         return 0
     fi
 
-    # 3. Створюємо venv і ставимо Django
     log "Створення віртуального середовища: $DJANGO_VENV"
     ensure_venv_package
     "$PYTHON_CMD" -m venv "$DJANGO_VENV"
@@ -176,13 +183,16 @@ install_django() {
 
 # ─── Група docker ────────────────────────────────────────────
 add_user_to_docker_group() {
-    local user="${SUDO_USER:-${USER:-$(id -un)}}"
-    if id -nG "$user" | grep -qw docker; then
-        log "Користувач $user вже в групі docker"
+    if ! getent group docker >/dev/null 2>&1; then
+        log "Група docker не знайдена — пропускаємо додавання користувача"
         return 0
     fi
-    log "Додавання $user в групу docker..."
-    $SUDO usermod -aG docker "$user"
+    if id -nG "$REAL_USER" 2>/dev/null | grep -qw docker; then
+        log "Користувач $REAL_USER вже в групі docker"
+        return 0
+    fi
+    log "Додавання $REAL_USER в групу docker..."
+    $SUDO usermod -aG docker "$REAL_USER"
     log "Щоб зміни набули чинності: newgrp docker (або перезайдіть у систему)"
 }
 
